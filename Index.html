@@ -469,137 +469,974 @@
     </div>
   </div>
 
-<script>
-/******************************************************************
- * ✅ Google Apps Script 전용 설정 (PUT/DELETE 안 씀)
- ******************************************************************/
-const API_BASE = "https://script.google.com/macros/s/AKfycbzvrs-Hc_ze03zaqxwbvovtXWTY86Ivhc96g9KHr6gXCR3Y9LqIUkc2pmIoAzvPwUaPig/exec";
-const STORAGE_KEY = "wms_raw_rows_v1";
-const MODE_KEY = "wms_storage_mode_v1";
+  <script>
+    /******************************************************************
+     * ✅ 여기에 "배포 URL(…/exec)"만 넣으면 됩니다.
+     ******************************************************************/
+    const API_BASE = "https://script.google.com/macros/s/AKfycbzvrs-Hc_ze03zaqxwbvovtXWTY86Ivhc96g9KHr6gXCR3Y9LqIUkc2pmIoAzvPwUaPig/exec"; // <-- 꼭 바꾸세요
+    const STORAGE_KEY = "wms_raw_rows_v1";
+    const MODE_KEY = "wms_storage_mode_v1";
 
-/******************************************************************
- * 기본 유틸
- ******************************************************************/
-function uid(){
-  return Math.random().toString(16).slice(2) + "-" + Date.now().toString(16);
-}
-function pad2(n){ return n < 10 ? "0"+n : ""+n; }
-function todayISODate(){
-  const d = new Date();
-  return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`;
-}
-function normalizeRow(r){
-  if(!r) return null;
-  return {
-    id: String(r.id || uid()),
-    store: String(r.store||""),
-    date: String(r.date||""),
-    gender: String(r.gender||""),
-    type: String(r.type||""),
-    boxes: Number(r.boxes)||0,
-    orderNo: String(r.orderNo||""),
-    createdAt: r.createdAt||"",
-    updatedAt: r.updatedAt||"",
-    ship: r.ship || null
-  };
-}
+    /******************************************************************
+     * JSONP (CORS 우회)
+     ******************************************************************/
+    function jsonp(url, timeoutMs = 12000){
+      return new Promise((resolve, reject) => {
+        const cbName = "__cb_" + Math.random().toString(16).slice(2);
+        const sep = url.includes("?") ? "&" : "?";
+        const full = url + sep + "callback=" + cbName;
 
-/******************************************************************
- * 로컬 저장
- ******************************************************************/
-function loadLocalRows(){
-  try{
-    const s = localStorage.getItem(STORAGE_KEY);
-    if(!s) return [];
-    return JSON.parse(s).map(normalizeRow);
-  }catch(e){ return []; }
-}
-function saveLocalRows(){
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(rows));
-}
+        let done = false;
+        const timer = setTimeout(() => {
+          if(done) return;
+          done = true;
+          cleanup();
+          reject(new Error("JSONP timeout"));
+        }, timeoutMs);
 
-/******************************************************************
- * 🔥 서버 API (Apps Script 전용)
- ******************************************************************/
-async function apiGetRows(){
-  const res = await fetch(API_BASE + "?action=list");
-  if(!res.ok) throw new Error("GET 실패 " + res.status);
-  const data = await res.json();
-  return (data.rows||[]).map(normalizeRow);
-}
+        function cleanup(){
+          clearTimeout(timer);
+          try { delete window[cbName]; } catch(_){}
+          if(script && script.parentNode) script.parentNode.removeChild(script);
+        }
 
-async function apiPutRows(allRows){
-  const res = await fetch(API_BASE, {
-    method:"POST",
-    headers:{ "Content-Type":"application/json" },
-    body: JSON.stringify({
-      action: "replaceAll",
-      rows: allRows
-    })
-  });
-  if(!res.ok) throw new Error("POST 실패 " + res.status);
-  return await res.json();
-}
+        window[cbName] = (data) => {
+          if(done) return;
+          done = true;
+          cleanup();
+          resolve(data);
+        };
 
-/******************************************************************
- * 상태/동기화
- ******************************************************************/
-let rows = loadLocalRows();
-let pushTimer = null;
+        const script = document.createElement("script");
+        script.src = full;
+        script.onerror = () => {
+          if(done) return;
+          done = true;
+          cleanup();
+          reject(new Error("JSONP load error"));
+        };
+        document.head.appendChild(script);
+      });
+    }
 
-function scheduleAutoPush(){
-  clearTimeout(pushTimer);
-  pushTimer = setTimeout(async ()=>{
-    try{
-      const remote = await apiGetRows();
-      rows = mergeRows(rows, remote);
+    // ----- 상태 UI -----
+    const $storageMode = document.getElementById("storageMode");
+    const $serverStatus = document.getElementById("serverStatus");
+    const $pullBtn = document.getElementById("pullBtn");
+    const $pushBtn = document.getElementById("pushBtn");
+    const $syncHint = document.getElementById("syncHint");
+
+    function setStatus(text, level){
+      const dot = `<span class="dot ${level||""}"></span>`;
+      $serverStatus.innerHTML = dot + escapeHtml(text);
+    }
+
+    function serverConfigured(){
+      return !!(API_BASE && API_BASE.includes("/exec") && !API_BASE.includes("여기에_배포ID"));
+    }
+
+    // ----- Local storage -----
+    function loadLocalRows(){
+      try{
+        const s = localStorage.getItem(STORAGE_KEY);
+        if(!s) return [];
+        const parsed = JSON.parse(s);
+        if(!Array.isArray(parsed)) return [];
+        return parsed.map(r => normalizeRow(r)).filter(Boolean);
+      }catch(e){
+        return [];
+      }
+    }
+
+    function saveLocalRows(){
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(rows));
+      const el = document.getElementById("lastSaved");
+      const now = new Date();
+      el.textContent = "저장됨: " + now.toLocaleString();
+    }
+
+    function loadMode(){
+      const m = localStorage.getItem(MODE_KEY);
+      if(m === "server" || m === "local") return m;
+      return "local";
+    }
+    function saveMode(m){
+      localStorage.setItem(MODE_KEY, m);
+    }
+
+    // ----- Utils -----
+    function pad2(n){ const x = String(n); return x.length === 1 ? "0" + x : x; }
+
+    function makeOrderNo(store, dateStr, type){
+      if(!store || !dateStr || !type) return "";
+      const d = new Date(dateStr + "T00:00:00");
+      const mm = pad2(d.getMonth() + 1);
+      const dd = pad2(d.getDate());
+      return `${store}_${mm}_${dd}_${type}`;
+    }
+
+    function typeLabel(type){ return type === "C" ? "의류" : "신발"; }
+
+    function escapeHtml(str){
+      return String(str)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    function uid(){ return Math.random().toString(16).slice(2) + "-" + Date.now().toString(16); }
+
+    function fmtDateTime(iso){
+      if(!iso) return "";
+      const d = new Date(iso);
+      if(Number.isNaN(d.getTime())) return "";
+      return d.toLocaleString();
+    }
+
+    function getInputAt(row){ return row.updatedAt || row.createdAt || ""; }
+
+    function todayISODate(){
+      const d = new Date();
+      return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`;
+    }
+
+    function nowHHMM(){
+      const d = new Date();
+      return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+    }
+
+    function shipKey(ship){
+      if(!ship) return "";
+      const t = (ship.shipTime || "").trim();
+      return `${ship.shipDate || ""} ${t}`;
+    }
+
+    function normalizeRow(r){
+      if(!r || typeof r !== "object") return null;
+
+      // Apps Script에서 ship이 JSON 문자열로 올 수도 있음
+      let ship = null;
+      if (r.ship && typeof r.ship === "string") {
+        const s = r.ship.trim();
+        if (s && (s.startsWith("{") || s.startsWith("["))) {
+          try { ship = JSON.parse(s); } catch(_) { ship = null; }
+        }
+      } else if (r.ship && typeof r.ship === "object") {
+        ship = r.ship;
+      }
+
+      const out = {
+        ...r,
+        id: String(r.id || ""),
+        store: String(r.store || "").trim(),
+        date: String(r.date || "").trim(),
+        gender: String(r.gender || "").trim(),
+        type: String(r.type || "").trim(),
+        boxes: Number(r.boxes) || 0,
+        orderNo: String(r.orderNo || "").trim(),
+        createdAt: r.createdAt ? String(r.createdAt) : "",
+        updatedAt: r.updatedAt ? String(r.updatedAt) : "",
+        ship: ship ? {
+          shipDate: ship.shipDate ? String(ship.shipDate) : "",
+          shipTime: ship.shipTime ? String(ship.shipTime) : "",
+          shippedAt: ship.shippedAt ? String(ship.shippedAt) : ""
+        } : null
+      };
+      if(!out.id) out.id = uid();
+      if(!out.orderNo) out.orderNo = makeOrderNo(out.store, out.date, out.type);
+      return out;
+    }
+
+    function safeIsoToTime(iso){
+      const d = new Date(iso);
+      if(Number.isNaN(d.getTime())) return 0;
+      return d.getTime();
+    }
+
+    // ----- Merge (충돌 해결: 최신 updatedAt/createdAt 우선) -----
+    function mergeRows(localArr, remoteArr){
+      const map = new Map();
+      for(const r of (localArr||[])){
+        const nr = normalizeRow(r);
+        if(!nr) continue;
+        map.set(nr.id, nr);
+      }
+      for(const r of (remoteArr||[])){
+        const nr = normalizeRow(r);
+        if(!nr) continue;
+
+        const existed = map.get(nr.id);
+        if(!existed){
+          map.set(nr.id, nr);
+          continue;
+        }
+        const tA = safeIsoToTime(existed.updatedAt || existed.createdAt);
+        const tB = safeIsoToTime(nr.updatedAt || nr.createdAt);
+        map.set(nr.id, (tB >= tA) ? nr : existed);
+      }
+      return Array.from(map.values());
+    }
+
+    /******************************************************************
+     * ✅ Apps Script API (JSONP)
+     ******************************************************************/
+    async function apiPing(){
+      const data = await jsonp(API_BASE + "?action=ping");
+      if(!data || !data.ok) throw new Error(data?.error || "ping failed");
+      return data;
+    }
+
+    async function apiList(){
+      const data = await jsonp(API_BASE + "?action=list");
+      if(!data || !data.ok) throw new Error(data?.error || "list failed");
+      return (data.rows || []).map(normalizeRow).filter(Boolean);
+    }
+
+    // upsert 1건 (JSONP GET)
+    async function apiUpsert(row){
+      const payload = encodeURIComponent(JSON.stringify(row));
+      const data = await jsonp(API_BASE + "?action=upsert&row=" + payload);
+      if(!data || !data.ok) throw new Error(data?.error || "upsert failed");
+      return data;
+    }
+
+    async function apiDelete(id){
+      const data = await jsonp(API_BASE + "?action=delete&id=" + encodeURIComponent(id));
+      if(!data || !data.ok) throw new Error(data?.error || "delete failed");
+      return data;
+    }
+
+    // 서버에 저장: 현재 rows를 "전부 upsert" (CORS 없이 안정)
+    async function apiSaveAll(allRows){
+      // 먼저 서버 읽어서 merge (충돌 최소화)
+      const remote = await apiList();
+      rows = mergeRows(allRows, remote);
       saveLocalRows();
-      await apiPutRows(rows);
-      console.log("✅ 서버 저장 완료");
-    }catch(e){
-      console.error("❌ 서버 저장 실패", e);
+
+      // 순차 upsert (너무 빨리 치면 제한 걸릴 수 있어 약간 딜레이)
+      for(let i=0;i<rows.length;i++){
+        await apiUpsert(rows[i]);
+        if(i % 10 === 9) await new Promise(r => setTimeout(r, 150));
+      }
+      return { ok:true, count: rows.length };
     }
-  }, 500);
-}
 
-function mergeRows(localArr, remoteArr){
-  const map = new Map();
-  localArr.forEach(r => map.set(r.id, r));
-  remoteArr.forEach(r => {
-    const old = map.get(r.id);
-    if(!old) map.set(r.id, r);
-    else{
-      const t1 = new Date(old.updatedAt||old.createdAt||0).getTime();
-      const t2 = new Date(r.updatedAt||r.createdAt||0).getTime();
-      map.set(r.id, t2 >= t1 ? r : old);
+    // ----- Rows -----
+    let rows = loadLocalRows();
+
+    // ----- Elements -----
+    const $store = document.getElementById("store");
+    const $date = document.getElementById("date");
+    const $gender = document.getElementById("gender");
+    const $type = document.getElementById("type");
+    const $boxes = document.getElementById("boxes");
+    const $orderPreview = document.getElementById("orderPreview");
+
+    const $addBtn = document.getElementById("addBtn");
+    const $sampleBtn = document.getElementById("sampleBtn");
+    const $clearBtn = document.getElementById("clearBtn");
+    const $exportBtn = document.getElementById("exportBtn");
+    const $importBtn = document.getElementById("importBtn");
+    const $fileInput = document.getElementById("fileInput");
+
+    const $tbody = document.getElementById("tbody");
+    const $sort = document.getElementById("sort");
+
+    const $fStore = document.getElementById("fStore");
+    const $fGender = document.getElementById("fGender");
+    const $fType = document.getElementById("fType");
+    const $resetFilterBtn = document.getElementById("resetFilterBtn");
+
+    const $kpiTbody = document.getElementById("kpiTbody");
+    const $kpiSummary = document.getElementById("kpiSummary");
+
+    const $shipTbody = document.getElementById("shipTbody");
+    const $shipSummary = document.getElementById("shipSummary");
+    const $shipSort = document.getElementById("shipSort");
+
+    // Modal
+    const $shipModalOverlay = document.getElementById("shipModalOverlay");
+    const $shipModalInfo = document.getElementById("shipModalInfo");
+    const $shipDate = document.getElementById("shipDate");
+    const $shipTime = document.getElementById("shipTime");
+    const $shipCancelBtn = document.getElementById("shipCancelBtn");
+    const $shipSaveBtn = document.getElementById("shipSaveBtn");
+
+    let shipTargetRowId = null;
+
+    (function initDefaultDate(){ $date.value = todayISODate(); })();
+
+    function updateOrderPreview(){
+      const store = ($store.value || "").trim();
+      const dateStr = ($date.value || "").trim();
+      const type = ($type.value || "").trim();
+      $orderPreview.value = makeOrderNo(store, dateStr, type);
     }
-  });
-  return Array.from(map.values());
-}
+    ["input","change"].forEach(evt=>{
+      $store.addEventListener(evt, updateOrderPreview);
+      $date.addEventListener(evt, updateOrderPreview);
+      $type.addEventListener(evt, updateOrderPreview);
+    });
+    updateOrderPreview();
 
-/******************************************************************
- * 예시 버튼 바인딩 (너 HTML에 이미 있음)
- ******************************************************************/
-document.getElementById("pullBtn").onclick = async ()=>{
-  rows = mergeRows(rows, await apiGetRows());
-  saveLocalRows();
-  alert("서버에서 불러오기 완료");
-};
+    function getFilteredRows(){
+      const fs = ($fStore.value || "").trim();
+      const fg = ($fGender.value || "").trim();
+      const ft = ($fType.value || "").trim();
 
-document.getElementById("pushBtn").onclick = async ()=>{
-  await apiPutRows(rows);
-  alert("서버에 저장 완료");
-};
+      let out = rows.slice();
 
-/******************************************************************
- * 최초 렌더용
- ******************************************************************/
-saveLocalRows();
-</script>
+      if(fs) out = out.filter(r => String(r.store).includes(fs));
+      if(fg) out = out.filter(r => r.gender === fg);
+      if(ft) out = out.filter(r => r.type === ft);
 
+      const mode = $sort.value;
+      out.sort((a,b)=>{
+        if(mode === "dateDesc") return (b.date||"").localeCompare(a.date||"");
+        if(mode === "dateAsc") return (a.date||"").localeCompare(b.date||"");
+        if(mode === "inputDesc") return String(getInputAt(b)).localeCompare(String(getInputAt(a)));
+        if(mode === "inputAsc") return String(getInputAt(a)).localeCompare(String(getInputAt(b)));
+        if(mode === "storeAsc") return String(a.store).localeCompare(String(b.store));
+        if(mode === "storeDesc") return String(b.store).localeCompare(String(a.store));
+        if(mode === "boxesDesc") return (b.boxes||0) - (a.boxes||0);
+        if(mode === "boxesAsc") return (a.boxes||0) - (b.boxes||0);
+        return 0;
+      });
+
+      return out;
+    }
+
+    function renderKPI(filtered){
+      const map = new Map();
+      for(const r of filtered){
+        const store = String(r.store);
+        if(!map.has(store)) map.set(store, {c:0, t:0});
+        const agg = map.get(store);
+        if(r.type === "C") agg.c += (Number(r.boxes)||0);
+        if(r.type === "T") agg.t += (Number(r.boxes)||0);
+      }
+
+      const stores = Array.from(map.keys()).sort((a,b)=>a.localeCompare(b));
+      const totalC = stores.reduce((acc,s)=>acc + map.get(s).c, 0);
+      const totalT = stores.reduce((acc,s)=>acc + map.get(s).t, 0);
+      const total = totalC + totalT;
+
+      $kpiSummary.textContent = `전체(C/T/합계): ${totalC} / ${totalT} / ${total} (필터 기준)`;
+
+      if(stores.length === 0){
+        $kpiTbody.innerHTML = `<tr><td colspan="4" class="small">표시할 데이터가 없습니다.</td></tr>`;
+        return;
+      }
+
+      $kpiTbody.innerHTML = stores.map(s=>{
+        const c = map.get(s).c;
+        const t = map.get(s).t;
+        const sum = c + t;
+        return `
+          <tr>
+            <td class="mono">${escapeHtml(s)}</td>
+            <td class="mono">${escapeHtml(c)}</td>
+            <td class="mono">${escapeHtml(t)}</td>
+            <td class="mono">${escapeHtml(sum)}</td>
+          </tr>
+        `;
+      }).join("");
+    }
+
+    function getShippedRows(){
+      return rows.filter(r => r.ship && r.ship.shipDate && r.ship.shipTime);
+    }
+
+    function renderShippingBoard(){
+      const shipped = getShippedRows().slice();
+      const mode = $shipSort.value;
+      shipped.sort((a,b)=>{
+        const ak = shipKey(a.ship);
+        const bk = shipKey(b.ship);
+        if(mode === "shipDesc") return bk.localeCompare(ak);
+        if(mode === "shipAsc") return ak.localeCompare(bk);
+        if(mode === "storeAsc") return String(a.store).localeCompare(String(b.store));
+        if(mode === "storeDesc") return String(b.store).localeCompare(String(a.store));
+        return 0;
+      });
+
+      const totalBoxes = shipped.reduce((acc,r)=>acc + (Number(r.boxes)||0), 0);
+      $shipSummary.textContent = `출고 ${shipped.length}건 / 박스 ${totalBoxes}`;
+
+      if(shipped.length === 0){
+        $shipTbody.innerHTML = `<tr><td colspan="8" class="small">출고 처리된 데이터가 없습니다.</td></tr>`;
+        return;
+      }
+
+      $shipTbody.innerHTML = shipped.map(r=>{
+        const pillClass = r.type === "C" ? "pill c" : "pill t";
+        return `
+          <tr>
+            <td class="mono">${escapeHtml(r.ship.shipDate)}</td>
+            <td class="mono">${escapeHtml(r.ship.shipTime)}</td>
+            <td class="mono">${escapeHtml(r.store)}</td>
+            <td class="mono">${escapeHtml(r.orderNo)}</td>
+            <td>${escapeHtml(r.gender)}</td>
+            <td><span class="${pillClass}">${typeLabel(r.type)} (${r.type})</span></td>
+            <td class="mono">${escapeHtml(r.boxes)}</td>
+            <td class="actions">
+              <button class="danger" onclick="unshipRow('${r.id}')">출고 취소</button>
+            </td>
+          </tr>
+        `;
+      }).join("");
+    }
+
+    function render(){
+      const data = getFilteredRows();
+
+      $tbody.innerHTML = data.map(r=>{
+        const pillClass = r.type === "C" ? "pill c" : "pill t";
+        const inputAt = fmtDateTime(getInputAt(r));
+        const shipped = !!(r.ship && r.ship.shipDate && r.ship.shipTime);
+        const shipBadge = shipped ? `<span class="pill ship">출고완료</span>` : ``;
+
+        return `
+          <tr>
+            <td class="mono">${escapeHtml(inputAt || "-")}</td>
+            <td class="mono">${escapeHtml(r.store)}</td>
+            <td class="mono">${escapeHtml(r.orderNo)} ${shipBadge}</td>
+            <td>${escapeHtml(r.gender)}</td>
+            <td><span class="${pillClass}">${typeLabel(r.type)} (${r.type})</span></td>
+            <td class="mono">${escapeHtml(r.boxes)}</td>
+            <td class="actions">
+              <button onclick="editRow('${r.id}')">수정</button>
+              <button class="warn" onclick="openShipModal('${r.id}')">출고</button>
+              <button class="danger" onclick="deleteRow('${r.id}')">삭제</button>
+            </td>
+          </tr>
+        `;
+      }).join("");
+
+      renderKPI(data);
+      renderShippingBoard();
+    }
+
+    // Row actions
+    window.deleteRow = async function(id){
+      const ok = confirm("해당 행을 삭제할까요?");
+      if(!ok) return;
+
+      rows = rows.filter(r => r.id !== id);
+      saveLocalRows();
+      render();
+
+      if($storageMode.value === "server" && serverConfigured()){
+        try{
+          await apiDelete(id);
+          setStatus("연결됨 / 삭제 반영", "ok");
+        }catch(e){
+          setStatus("연결됨(로컬) / 서버 삭제 실패", "warn");
+        }
+      }
+    }
+
+    window.editRow = function(id){
+      const r = rows.find(x => x.id === id);
+      if(!r) return;
+
+      $store.value = r.store;
+      $date.value = r.date;
+      $gender.value = r.gender;
+      $type.value = r.type;
+      $boxes.value = r.boxes;
+
+      updateOrderPreview();
+
+      $addBtn.textContent = "수정 반영";
+      $addBtn.classList.add("primary");
+      $addBtn.dataset.editing = id;
+      window.scrollTo({top:0, behavior:"smooth"});
+    }
+
+    function resetAddMode(){
+      $addBtn.textContent = "추가";
+      delete $addBtn.dataset.editing;
+    }
+
+    // Shipping modal
+    function showModal(){
+      $shipModalOverlay.style.display = "flex";
+      $shipModalOverlay.setAttribute("aria-hidden", "false");
+    }
+    function hideModal(){
+      $shipModalOverlay.style.display = "none";
+      $shipModalOverlay.setAttribute("aria-hidden", "true");
+      shipTargetRowId = null;
+    }
+
+    window.openShipModal = function(id){
+      const r = rows.find(x => x.id === id);
+      if(!r) return;
+
+      shipTargetRowId = id;
+
+      $shipModalInfo.innerHTML = `
+        <div><b>오더:</b> <span class="mono">${escapeHtml(r.orderNo)}</span></div>
+        <div class="small"><b>매장:</b> <span class="mono">${escapeHtml(r.store)}</span> /
+          <b>성별:</b> ${escapeHtml(r.gender)} /
+          <b>구분:</b> ${escapeHtml(typeLabel(r.type))}(${escapeHtml(r.type)}) /
+          <b>박스:</b> <span class="mono">${escapeHtml(r.boxes)}</span>
+        </div>
+      `;
+
+      $shipDate.value = (r.ship && r.ship.shipDate) ? r.ship.shipDate : todayISODate();
+      $shipTime.value = (r.ship && r.ship.shipTime) ? r.ship.shipTime : nowHHMM();
+
+      showModal();
+    }
+
+    window.unshipRow = async function(id){
+      const r = rows.find(x => x.id === id);
+      if(!r) return;
+
+      const ok = confirm("출고를 취소할까요?");
+      if(!ok) return;
+
+      r.ship = null;
+      r.updatedAt = new Date().toISOString();
+      saveLocalRows();
+      render();
+
+      if($storageMode.value === "server" && serverConfigured()){
+        try{
+          await apiUpsert(r);
+          setStatus("연결됨 / 출고취소 저장", "ok");
+        }catch(e){
+          setStatus("연결됨(로컬) / 서버 저장 실패", "warn");
+        }
+      }
+    }
+
+    $shipCancelBtn.addEventListener("click", hideModal);
+    $shipModalOverlay.addEventListener("click", (e)=>{
+      if(e.target === $shipModalOverlay) hideModal();
+    });
+
+    $shipSaveBtn.addEventListener("click", async ()=>{
+      if(!shipTargetRowId) return;
+
+      const shipDate = ($shipDate.value || "").trim();
+      const shipTime = ($shipTime.value || "").trim();
+
+      if(!shipDate){ alert("출고일을 선택해주세요."); return; }
+      if(!shipTime){ alert("출고시간을 선택해주세요."); return; }
+
+      const r = rows.find(x => x.id === shipTargetRowId);
+      if(!r) return;
+
+      r.ship = { shipDate, shipTime, shippedAt: new Date().toISOString() };
+      r.updatedAt = new Date().toISOString();
+
+      saveLocalRows();
+      render();
+      hideModal();
+
+      if($storageMode.value === "server" && serverConfigured()){
+        try{
+          await apiUpsert(r);
+          setStatus("연결됨 / 출고 저장", "ok");
+        }catch(e){
+          setStatus("연결됨(로컬) / 서버 저장 실패", "warn");
+        }
+      }
+    });
+
+    document.addEventListener("keydown", (e)=>{
+      if(e.key === "Escape" && $shipModalOverlay.style.display === "flex"){
+        hideModal();
+      }
+    });
+
+    // Add / update row
+    $addBtn.addEventListener("click", async ()=>{
+      const store = ($store.value || "").trim();
+      const dateStr = ($date.value || "").trim();
+      const gender = ($gender.value || "").trim();
+      const type = ($type.value || "").trim();
+      const boxes = Number(($boxes.value || "").trim());
+
+      if(!store){ alert("매장번호를 입력해주세요."); return; }
+      if(!dateStr){ alert("오더 생성일을 선택해주세요."); return; }
+      if(!gender){ alert("성별을 선택해주세요."); return; }
+      if(!(type === "C" || type === "T")){ alert("구분을 선택해주세요. (C/T)"); return; }
+      if(!Number.isFinite(boxes) || boxes < 0){ alert("박스 수량을 0 이상 숫자로 입력해주세요."); return; }
+
+      const orderNo = makeOrderNo(store, dateStr, type);
+      if(!orderNo){ alert("오더번호 생성에 실패했습니다. 입력값을 확인해주세요."); return; }
+
+      const nowIso = new Date().toISOString();
+      const editingId = $addBtn.dataset.editing;
+
+      let rowToSave = null;
+
+      if(editingId){
+        const idx = rows.findIndex(r => r.id === editingId);
+        if(idx >= 0){
+          rows[idx] = {
+            ...rows[idx],
+            store,
+            date: dateStr,
+            gender,
+            type,
+            boxes,
+            orderNo,
+            updatedAt: nowIso,
+            createdAt: rows[idx].createdAt || nowIso,
+            ship: rows[idx].ship || null
+          };
+          rowToSave = rows[idx];
+        }
+        resetAddMode();
+      }else{
+        rowToSave = {
+          id: uid(),
+          store,
+          date: dateStr,
+          gender,
+          type,
+          boxes,
+          orderNo,
+          createdAt: nowIso,
+          updatedAt: "",
+          ship: null
+        };
+        rows.push(rowToSave);
+      }
+
+      saveLocalRows();
+      render();
+
+      if($storageMode.value === "server" && serverConfigured()){
+        try{
+          await apiUpsert(rowToSave);
+          setStatus("연결됨 / 저장됨", "ok");
+          $syncHint.textContent = "서버 모드: 저장 시 서버에 바로 반영됩니다.";
+        }catch(e){
+          setStatus("연결 실패 (배포/권한/URL 확인)", "bad");
+          $syncHint.textContent = String(e?.message || e);
+        }
+      }
+
+      $boxes.value = "";
+      updateOrderPreview();
+    });
+
+    $sampleBtn.addEventListener("click", ()=>{
+      const now = new Date().toISOString();
+      const sample = [
+        {store:"9230", date:"2025-12-07", gender:"CRO", type:"T", boxes:2},
+        {store:"9230", date:"2025-12-10", gender:"CRO", type:"T", boxes:2},
+        {store:"9230", date:"2025-12-13", gender:"NINO", type:"T", boxes:2},
+        {store:"9230", date:"2025-12-15", gender:"NINO", type:"T", boxes:3},
+        {store:"9230", date:"2025-12-18", gender:"SRA", type:"T", boxes:5},
+      ].map(x => ({
+        id: uid(),
+        ...x,
+        orderNo: makeOrderNo(x.store, x.date, x.type),
+        createdAt: now,
+        updatedAt: "",
+        ship: null
+      }));
+
+      rows = rows.concat(sample);
+      saveLocalRows();
+      render();
+    });
+
+    $clearBtn.addEventListener("click", ()=>{
+      const ok = confirm("전체 데이터를 삭제할까요? (되돌릴 수 없음)");
+      if(!ok) return;
+      rows = [];
+      saveLocalRows();
+      render();
+      resetAddMode();
+    });
+
+    // Filters & sort
+    [$fStore, $fGender, $fType, $sort].forEach(el=>{
+      el.addEventListener("input", render);
+      el.addEventListener("change", render);
+    });
+    $shipSort.addEventListener("change", render);
+
+    $resetFilterBtn.addEventListener("click", ()=>{
+      $fStore.value = "";
+      $fGender.value = "";
+      $fType.value = "";
+      render();
+    });
+
+    // CSV Export/Import (원래대로)
+    $exportBtn.addEventListener("click", ()=>{
+      const header = [
+        "store","date","gender","type","boxes","orderNo","createdAt","updatedAt",
+        "shipDate","shipTime","shippedAt"
+      ];
+      const lines = [header.join(",")].concat(
+        rows.map(r => [
+          r.store, r.date, r.gender, r.type, r.boxes, r.orderNo, r.createdAt||"", r.updatedAt||"",
+          (r.ship?.shipDate||""), (r.ship?.shipTime||""), (r.ship?.shippedAt||"")
+        ].map(v => `"${String(v).replaceAll('"','""')}"`).join(","))
+      );
+      const blob = new Blob([lines.join("\n")], {type:"text/csv;charset=utf-8"});
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "wms_raw_data.csv";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    });
+
+    $importBtn.addEventListener("click", ()=>{
+      $fileInput.value = "";
+      $fileInput.click();
+    });
+
+    $fileInput.addEventListener("change", async (e)=>{
+      const file = e.target.files?.[0];
+      if(!file) return;
+
+      const text = await file.text();
+      const parsed = parseCSV(text);
+      if(parsed.length === 0){
+        alert("CSV에서 데이터를 찾지 못했습니다.");
+        return;
+      }
+
+      const cols = parsed[0].map(c => String(c).trim());
+      const idx = (names) => cols.findIndex(c => names.includes(c));
+
+      const iStore = idx(["store","매장번호","매장 번호"]);
+      const iDate  = idx(["date","오더생성일","오더 생성일","생성일"]);
+      const iGender= idx(["gender","성별"]);
+      const iType  = idx(["type","구분"]);
+      const iBoxes = idx(["boxes","박스","박스수량","박스 수량"]);
+      const iOrderNo = idx(["orderNo","오더번호","오더 번호"]);
+
+      const iCreatedAt = idx(["createdAt","입력일자","created_at","created"]);
+      const iUpdatedAt = idx(["updatedAt","수정일자","updated_at","updated"]);
+
+      const iShipDate = idx(["shipDate","출고일","출고일자"]);
+      const iShipTime = idx(["shipTime","출고시간"]);
+      const iShippedAt = idx(["shippedAt","출고처리일시","출고처리"]);
+
+      if([iStore,iDate,iGender,iType,iBoxes].some(x=>x<0)){
+        alert("필수 컬럼을 찾을 수 없습니다. (store/date/gender/type/boxes)");
+        return;
+      }
+
+      const incoming = [];
+      for(let i=1;i<parsed.length;i++){
+        const row = parsed[i];
+        if(row.length === 0) continue;
+
+        const store = String(row[iStore] ?? "").trim();
+        const dateStr = normalizeDate(String(row[iDate] ?? "").trim());
+        const gender = String(row[iGender] ?? "").trim();
+        const typeRaw = String(row[iType] ?? "").trim().toUpperCase();
+        const type = (typeRaw === "의류" ? "C" : typeRaw === "신발" ? "T" : typeRaw);
+        const boxes = Number(String(row[iBoxes] ?? "").trim());
+
+        const createdAt = iCreatedAt >= 0 ? String(row[iCreatedAt] ?? "").trim() : "";
+        const updatedAt = iUpdatedAt >= 0 ? String(row[iUpdatedAt] ?? "").trim() : "";
+
+        let ship = null;
+        if(iShipDate >= 0 && iShipTime >= 0){
+          const sd = String(row[iShipDate] ?? "").trim();
+          const st = String(row[iShipTime] ?? "").trim();
+          const sa = iShippedAt >= 0 ? String(row[iShippedAt] ?? "").trim() : "";
+          if(sd && st){
+            ship = {
+              shipDate: normalizeDate(sd) || sd,
+              shipTime: st,
+              shippedAt: (sa && !Number.isNaN(new Date(sa).getTime())) ? sa : ""
+            };
+          }
+        }
+
+        if(!store || !dateStr || !gender || !(type==="C"||type==="T") || !Number.isFinite(boxes)) continue;
+
+        const nowIso = new Date().toISOString();
+        const orderNoFromFile = (iOrderNo >= 0) ? String(row[iOrderNo] ?? "").trim() : "";
+        const orderNo = orderNoFromFile || makeOrderNo(store, dateStr, type);
+
+        incoming.push({
+          id: uid(),
+          store,
+          date: dateStr,
+          gender,
+          type,
+          boxes,
+          orderNo,
+          createdAt: (createdAt && !Number.isNaN(new Date(createdAt).getTime())) ? createdAt : nowIso,
+          updatedAt: (updatedAt && !Number.isNaN(new Date(updatedAt).getTime())) ? updatedAt : "",
+          ship
+        });
+      }
+
+      if(incoming.length === 0){
+        alert("가져올 유효 데이터가 없습니다. (형식/값 확인 필요)");
+        return;
+      }
+
+      rows = rows.concat(incoming);
+      saveLocalRows();
+      render();
+      alert(`가져오기 완료: ${incoming.length}건`);
+    });
+
+    function parseCSV(text){
+      const out = [];
+      let row = [];
+      let cur = "";
+      let inQuotes = false;
+
+      for(let i=0;i<text.length;i++){
+        const ch = text[i];
+        const next = text[i+1];
+
+        if(inQuotes){
+          if(ch === '"' && next === '"'){ cur += '"'; i++; continue; }
+          if(ch === '"'){ inQuotes = false; continue; }
+          cur += ch; continue;
+        }else{
+          if(ch === '"'){ inQuotes = true; continue; }
+          if(ch === ','){ row.push(cur); cur=""; continue; }
+          if(ch === '\n'){
+            row.push(cur); cur="";
+            row = row.map(x => typeof x === "string" ? x.replace(/\r$/, "") : x);
+            if(row.some(c => String(c).trim() !== "")) out.push(row);
+            row = [];
+            continue;
+          }
+          cur += ch;
+        }
+      }
+      row.push(cur);
+      row = row.map(x => typeof x === "string" ? x.replace(/\r$/, "") : x);
+      if(row.some(c => String(c).trim() !== "")) out.push(row);
+      return out;
+    }
+
+    function normalizeDate(s){
+      if(!s) return "";
+      if(/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+      if(/^\d{4}\/\d{1,2}\/\d{1,2}$/.test(s)){
+        const [y,m,d] = s.split("/");
+        return `${y}-${pad2(Number(m))}-${pad2(Number(d))}`;
+      }
+      if(/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(s)){
+        const [m,d,y] = s.split("/");
+        return `${y}-${pad2(Number(m))}-${pad2(Number(d))}`;
+      }
+      return "";
+    }
+
+    /******************************************************************
+     * 서버 연결/동기화 버튼
+     ******************************************************************/
+    async function pullFromServer(){
+      if(!serverConfigured()){
+        alert("API_BASE에 배포 URL(…/exec)을 넣어주세요.");
+        return;
+      }
+      try{
+        setStatus("불러오는 중…", "warn");
+        const remote = await apiList();
+        rows = mergeRows(rows, remote);
+        saveLocalRows();
+        render();
+        setStatus("연결됨 / 불러오기 완료", "ok");
+        $syncHint.textContent = `서버 ${remote.length}건 불러옴 (로컬과 병합)`;
+      }catch(e){
+        setStatus("불러오기 실패 (배포/권한/URL)", "bad");
+        $syncHint.textContent = String(e?.message || e);
+        alert("서버 불러오기 실패:\n" + (e?.message || e));
+      }
+    }
+
+    async function pushToServerNow(){
+      if(!serverConfigured()){
+        alert("API_BASE에 배포 URL(…/exec)을 넣어주세요.");
+        return;
+      }
+      try{
+        setStatus("저장 중…", "warn");
+        const res = await apiSaveAll(rows);
+        setStatus("연결됨 / 저장 완료", "ok");
+        $syncHint.textContent = `서버에 ${res.count}건 저장 완료`;
+      }catch(e){
+        setStatus("저장 실패 (배포/권한/URL)", "bad");
+        $syncHint.textContent = String(e?.message || e);
+        alert("서버 저장 실패:\n" + (e?.message || e));
+      }
+    }
+
+    $pullBtn.addEventListener("click", pullFromServer);
+    $pushBtn.addEventListener("click", pushToServerNow);
+
+    /******************************************************************
+     * 모드 init + 서버 ping
+     ******************************************************************/
+    (async function init(){
+      const m = loadMode();
+      $storageMode.value = m;
+
+      if(m === "server"){
+        if(!serverConfigured()){
+          setStatus("서버 모드(미설정) - API_BASE 필요", "bad");
+          $syncHint.textContent = "API_BASE를 배포 URL로 설정하세요.";
+        }else{
+          try{
+            setStatus("연결 확인 중…", "warn");
+            await apiPing();
+            setStatus("연결됨", "ok");
+            $syncHint.textContent = "서버 모드: 불러오기 후 사용 권장";
+          }catch(e){
+            setStatus("미연결 (배포/권한/URL)", "bad");
+            $syncHint.textContent = String(e?.message || e);
+          }
+        }
+      }else{
+        setStatus("로컬 모드", "");
+        $syncHint.textContent = "로컬 모드: 이 PC/브라우저에만 저장됩니다.";
+      }
+
+      saveLocalRows();
+      render();
+    })();
+
+    $storageMode.addEventListener("change", async ()=>{
+      saveMode($storageMode.value);
+
+      if($storageMode.value === "server"){
+        if(!serverConfigured()){
+          setStatus("서버 모드(미설정) - API_BASE 필요", "bad");
+          $syncHint.textContent = "API_BASE를 배포 URL로 설정하세요.";
+          return;
+        }
+        try{
+          setStatus("연결 확인 중…", "warn");
+          await apiPing();
+          setStatus("연결됨", "ok");
+          $syncHint.textContent = "서버 모드: 불러오기 후 사용 권장";
+        }catch(e){
+          setStatus("미연결 (배포/권한/URL)", "bad");
+          $syncHint.textContent = String(e?.message || e);
+        }
+      }else{
+        setStatus("로컬 모드", "");
+        $syncHint.textContent = "로컬 모드: 이 PC/브라우저에만 저장됩니다.";
+      }
+    });
+  </script>
 </body>
 </html>
-
-
-
-
